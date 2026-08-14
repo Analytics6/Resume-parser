@@ -1,6 +1,6 @@
 import re
 import time
-from pathlib import Path
+from typing import Any
 
 import chromadb
 import numpy as np
@@ -18,70 +18,108 @@ MODEL_DEFINITIONS = [
     {"name": "HashingVectorizer", "type": "hashing"},
     {"name": "Word2Vec", "type": "word2vec"},
     {"name": "SentenceTransformer: all-MiniLM-L6-v2", "type": "sentence_transformer", "model": "all-MiniLM-L6-v2"},
-    {"name": "SentenceTransformer: all-mpnet-base-v2", "type": "sentence_transformer", "model": "all-mpnet-base-v2"},
+    {"name": "SentenceTransformer: all-MiniLM-L12-v2", "type": "sentence_transformer", "model": "all-MiniLM-L12-v2"},
+    {"name": "SentenceTransformer: paraphrase-MiniLM-L6-v2", "type": "sentence_transformer", "model": "paraphrase-MiniLM-L6-v2"},
     {"name": "SentenceTransformer: paraphrase-MiniLM-L12-v2", "type": "sentence_transformer", "model": "paraphrase-MiniLM-L12-v2"},
-    {"name": "SentenceTransformer: stsb-roberta-base-v2", "type": "sentence_transformer", "model": "stsb-roberta-base-v2"},
-    {"name": "SentenceTransformer: intfloat/e5-base-v2", "type": "sentence_transformer", "model": "intfloat/e5-base-v2"},
+    {"name": "SentenceTransformer: all-mpnet-base-v2", "type": "sentence_transformer", "model": "all-mpnet-base-v2"},
     {"name": "SentenceTransformer: BAAI/bge-small-en-v1.5", "type": "sentence_transformer", "model": "BAAI/bge-small-en-v1.5"},
 ]
+
+MODEL_CACHE: dict[str, Any] = {}
+
+
+def _collection_name_for(model: dict) -> str:
+    return "resume_" + re.sub(r"[^a-z0-9]+", "_", model["name"].lower()).strip("_")
 
 
 def _tokenize(text: str):
     return re.findall(r"\b[a-zA-Z0-9-]+\b", text.lower())
 
 
-def _collect_embeddings(model, texts):
+def _fit_or_get_model(model: dict, texts):
+    key = model["name"]
+    if key in MODEL_CACHE:
+        return MODEL_CACHE[key]
+
     if model["type"] == "tfidf":
         vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
         matrix = vectorizer.fit_transform(texts)
-        return matrix.toarray(), vectorizer
+        trained = {"vectorizer": vectorizer, "matrix": matrix}
+        MODEL_CACHE[key] = trained
+        return trained
 
     if model["type"] == "count":
         vectorizer = CountVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
         matrix = vectorizer.fit_transform(texts)
-        return matrix.toarray(), vectorizer
+        trained = {"vectorizer": vectorizer, "matrix": matrix}
+        MODEL_CACHE[key] = trained
+        return trained
 
     if model["type"] == "hashing":
-        vectorizer = HashingVectorizer(n_features=2**18, alternate_sign=False, stop_words="english")
+        vectorizer = HashingVectorizer(n_features=2**14, alternate_sign=False, stop_words="english")
         matrix = vectorizer.transform(texts)
-        return matrix.toarray(), vectorizer
+        trained = {"vectorizer": vectorizer, "matrix": matrix}
+        MODEL_CACHE[key] = trained
+        return trained
 
     if model["type"] == "word2vec":
         sentences = [_tokenize(text) for text in texts]
         model_w2v = Word2Vec(sentences=sentences, vector_size=100, min_count=1, workers=1, epochs=25, seed=42)
-        vectors = []
-        for tokens in sentences:
-            token_vectors = [model_w2v.wv[token] for token in tokens if token in model_w2v.wv]
-            if len(token_vectors) == 0:
-                vectors.append(np.zeros(100, dtype=np.float32))
-            else:
-                vectors.append(np.mean(token_vectors, axis=0).astype(np.float32))
-        return np.array(vectors, dtype=np.float32), model_w2v
+        MODEL_CACHE[key] = model_w2v
+        return model_w2v
 
     if model["type"] == "sentence_transformer":
         st_model = SentenceTransformer(model["model"])
-        embeddings = st_model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
-        return np.asarray(embeddings, dtype=np.float32), st_model
+        MODEL_CACHE[key] = st_model
+        return st_model
 
     raise ValueError(f"Unsupported model type: {model['type']}")
 
 
-def _embed_single(model, text: str):
+def _collect_embeddings(model, texts):
+    trained = _fit_or_get_model(model, texts)
+
     if model["type"] in {"tfidf", "count", "hashing"}:
-        raise ValueError("Vectorizer models require an index to be fit first.")
+        vectorizer = trained["vectorizer"]
+        matrix = vectorizer.transform(texts)
+        return np.asarray(matrix.toarray(), dtype=np.float32), vectorizer
+
     if model["type"] == "word2vec":
-        tokens = _tokenize(text)
+        sentences = [_tokenize(text) for text in texts]
+        vectors = []
+        for tokens in sentences:
+            token_vectors = [trained.wv[token] for token in tokens if token in trained.wv]
+            if len(token_vectors) == 0:
+                vectors.append(np.zeros(100, dtype=np.float32))
+            else:
+                vectors.append(np.mean(token_vectors, axis=0).astype(np.float32))
+        return np.asarray(vectors, dtype=np.float32), trained
+
+    if model["type"] == "sentence_transformer":
+        embeddings = trained.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        return np.asarray(embeddings, dtype=np.float32), trained
+
+    raise ValueError(f"Unsupported model type: {model['type']}")
+
+
+def _query_embedding_for_model(model: dict, query: str):
+    trained = _fit_or_get_model(model, [query])
+
+    if model["type"] in {"tfidf", "count", "hashing"}:
+        vectorizer = trained["vectorizer"]
+        return np.asarray(vectorizer.transform([query]).toarray()[0], dtype=np.float32)
+
+    if model["type"] == "word2vec":
+        tokens = _tokenize(query)
         if not tokens:
             return np.zeros(100, dtype=np.float32)
-        st_model = Word2Vec.load(str(Path("temp").joinpath(f"{model['name']}_w2v.model")))
-        vecs = [st_model.wv[token] for token in tokens if token in st_model.wv]
+        vecs = [trained.wv[token] for token in tokens if token in trained.wv]
         if not vecs:
             return np.zeros(100, dtype=np.float32)
         return np.mean(vecs, axis=0).astype(np.float32)
 
     if model["type"] == "sentence_transformer":
-        emb_model = SentenceTransformer(model["model"])
-        return np.asarray(emb_model.encode([text], show_progress_bar=False), dtype=np.float32)[0]
+        return np.asarray(trained.encode([query], show_progress_bar=False), dtype=np.float32)[0]
 
     raise ValueError(f"Unsupported model type: {model['type']}")
 
@@ -98,7 +136,7 @@ def build_chroma_collections(df: pd.DataFrame):
     for model in MODEL_DEFINITIONS:
         texts = df["resume_text"].tolist()
         embeddings, _ = _collect_embeddings(model, texts)
-        collection_name = "resume_" + re.sub(r"[^a-z0-9]+", "_", model["name"].lower()).strip("_")
+        collection_name = _collection_name_for(model)
         try:
             client.delete_collection(name=collection_name)
         except Exception:
@@ -113,34 +151,14 @@ def build_chroma_collections(df: pd.DataFrame):
 
 def search_collection(collection, query: str, n_results: int = 5):
     model_key = collection.name
-    matching_model = next((m for m in MODEL_DEFINITIONS if "resume_" + re.sub(r"[^a-z0-9]+", "_", m["name"].lower()).strip("_") == model_key), None)
+    matching_model = next((m for m in MODEL_DEFINITIONS if _collection_name_for(m) == model_key), None)
     if matching_model is None:
         raise ValueError(f"No matching embedding model found for collection {model_key}")
 
-    if matching_model["type"] == "sentence_transformer":
-        query_vector = np.asarray(SentenceTransformer(matching_model["model"]).encode([query], show_progress_bar=False), dtype=np.float32)[0].tolist()
-    elif matching_model["type"] == "word2vec":
-        sentences = [_tokenize(query)]
-        w2v_model = Word2Vec(sentences=sentences, vector_size=100, min_count=1, workers=1, epochs=20, seed=42)
-        tokens = _tokenize(query)
-        vecs = [w2v_model.wv[token] for token in tokens if token in w2v_model.wv]
-        if not vecs:
-            query_vector = np.zeros(100, dtype=np.float32).tolist()
-        else:
-            query_vector = np.mean(vecs, axis=0).astype(np.float32).tolist()
-    else:
-        vectorizer = None
-        if matching_model["type"] == "tfidf":
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
-        elif matching_model["type"] == "count":
-            vectorizer = CountVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
-        elif matching_model["type"] == "hashing":
-            vectorizer = HashingVectorizer(n_features=2**18, alternate_sign=False, stop_words="english")
-        if vectorizer is None:
-            raise ValueError("Unsupported vectorizer")
-        query_vector = vectorizer.fit_transform([query]).toarray()[0].tolist()
+    if matching_model["name"] not in MODEL_CACHE:
+        raise ValueError(f"Model {matching_model['name']} has not been trained yet. Run build_chroma_collections() first.")
 
+    query_vector = _query_embedding_for_model(matching_model, query).tolist()
     result = collection.query(query_embeddings=[query_vector], n_results=n_results, include=["documents", "metadatas", "distances"])
     return result
 
@@ -151,14 +169,12 @@ def compare_models(df: pd.DataFrame, top_n: int = 5):
     report_rows = []
     for model in MODEL_DEFINITIONS:
         name = model["name"]
-        collection_name = "resume_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        collection_name = _collection_name_for(model)
         collection = client.get_collection(name=collection_name)
         hits = 0
         total = 0
         avg_latency = 0.0
         for expected_category, query in query_map.items():
-            if expected_category not in [category["name"] for category in CATEGORIES]:
-                continue
             start = time.perf_counter()
             result = search_collection(collection, query, n_results=top_n)
             latency_ms = (time.perf_counter() - start) * 1000
@@ -183,7 +199,7 @@ def get_query_results(df: pd.DataFrame, query: str, top_n: int = 5):
     client = chromadb.PersistentClient(path="./chroma_store")
     for model in MODEL_DEFINITIONS:
         name = model["name"]
-        collection_name = "resume_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        collection_name = _collection_name_for(model)
         collection = client.get_collection(name=collection_name)
         query_response = search_collection(collection, query, n_results=top_n)
         documents = query_response.get("documents", [[]])[0]
